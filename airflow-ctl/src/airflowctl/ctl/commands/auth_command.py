@@ -18,11 +18,14 @@
 
 from __future__ import annotations
 
+import base64
 import getpass
 import glob
 import json
 import os
 import sys
+import webbrowser
+from datetime import UTC, datetime
 
 import keyring
 import rich
@@ -37,6 +40,16 @@ from airflowctl.ctl.console_formatting import AirflowConsole
 def login(args, api_client=NEW_API_CLIENT) -> None:
     """Login to a provider."""
     success_message = "[green]Login successful! Welcome to airflowctl![/green]"
+
+    if args.web:
+        pasted_token, expires_at = _prompt_for_web_ui_token(args)
+        Credentials(api_url=args.api_url, api_token=pasted_token, api_environment=args.env).save()
+        rich.print(success_message)
+        rich.print(
+            f"The token expires at {expires_at.astimezone():%Y-%m-%d %H:%M %Z}. "
+            "Run this command again to log in after that."
+        )
+        return
 
     username = args.username
     password = args.password
@@ -102,6 +115,55 @@ def login(args, api_client=NEW_API_CLIENT) -> None:
         api_environment=args.env,
     ).save(args.skip_keyring)
     rich.print(success_message)
+
+
+def _prompt_for_web_ui_token(args) -> tuple[str, datetime]:
+    """Open the Airflow UI and read the token the user generates there."""
+    if args.api_token or args.username or args.password or args.skip_keyring:
+        rich.print(
+            "[red]--web cannot be combined with --api-token, --username, --password or --skip-keyring.[/red]"
+        )
+        sys.exit(1)
+    if not sys.stdin.isatty():
+        rich.print("[red]--web needs an interactive terminal to paste the token into.[/red]")
+        rich.print(
+            "[green]Please pass:[/green] [blue]--api-token[/blue] or set "
+            "[blue]AIRFLOW_CLI_TOKEN[/blue] environment variable instead."
+        )
+        sys.exit(1)
+
+    ui_url = f"{args.api_url.rstrip('/')}/"
+    rich.print(f"[blue]Opening[/blue] {ui_url} [blue]in your browser.[/blue]")
+    if not webbrowser.open(ui_url):
+        rich.print("[yellow]Could not open a browser. Open the URL above manually.[/yellow]")
+    rich.print(
+        "Log in, open the user menu, click [bold]Generate Token[/bold] and choose [bold]CLI Token[/bold]."
+    )
+
+    token = getpass.getpass(f"[{args.env}] Paste the token (input is hidden): ").strip()
+    expires_at = _extract_token_expiry(token)
+    if expires_at is None:
+        rich.print("[red]That is not an Airflow token. Copy it again from the Generate Token dialog.[/red]")
+        sys.exit(1)
+    if expires_at <= datetime.now(tz=UTC):
+        rich.print("[red]That token has already expired. Generate a new one in the Airflow UI.[/red]")
+        sys.exit(1)
+    return token, expires_at
+
+
+def _extract_token_expiry(token: str) -> datetime | None:
+    """
+    Return the ``exp`` claim of a JWT, or None if the string is not a JWT carrying one.
+
+    The signature is not verified: the API server does that on every request. This only
+    catches a bad paste early and tells the user when they will need to log in again.
+    """
+    try:
+        payload = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        return datetime.fromtimestamp(claims["exp"], tz=UTC)
+    except (IndexError, KeyError, TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 @provide_api_client(kind=ClientKind.AUTH)

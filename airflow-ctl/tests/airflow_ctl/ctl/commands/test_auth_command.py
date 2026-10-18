@@ -16,18 +16,34 @@
 # under the License.
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import tempfile
+from datetime import UTC, datetime, timedelta
 from unittest import mock
 from unittest.mock import patch
 
 import pytest
 
-from airflowctl.api.client import ClientKind
+from airflowctl.api.client import Client, ClientKind
 from airflowctl.api.datamodels.auth_generated import LoginResponse
 from airflowctl.ctl import cli_parser
 from airflowctl.ctl.commands import auth_command
+
+FROZEN_NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+
+def _build_jwt(claims: dict) -> str:
+    def encode(segment: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(segment).encode()).rstrip(b"=").decode()
+
+    return f"{encode({'alg': 'HS512', 'typ': 'JWT'})}.{encode(claims)}.signature"
+
+
+VALID_TOKEN = _build_jwt({"sub": "1", "exp": int((FROZEN_NOW + timedelta(hours=1)).timestamp())})
+EXPIRED_TOKEN = _build_jwt({"sub": "1", "exp": int((FROZEN_NOW - timedelta(minutes=1)).timestamp())})
 
 
 class TestCliAuthCommands:
@@ -254,6 +270,121 @@ class TestCliAuthCommands:
                 ),
                 api_client=api_client,
             )
+
+
+class TestCliAuthLoginWeb:
+    parser = cli_parser.get_parser()
+
+    @pytest.mark.parametrize(
+        ("api_url", "expected_ui_url", "browser_opened"),
+        [
+            ("http://localhost:8080", "http://localhost:8080/", True),
+            ("https://example.com/airflow/", "https://example.com/airflow/", False),
+        ],
+    )
+    @mock.patch("airflowctl.ctl.commands.auth_command.getpass.getpass", autospec=True)
+    @mock.patch("airflowctl.ctl.commands.auth_command.webbrowser.open", autospec=True)
+    @mock.patch("sys.stdin", spec=io.TextIOWrapper)
+    @mock.patch("airflowctl.api.client.keyring", autospec=True)
+    def test_login_web_saves_pasted_token(
+        self,
+        mock_keyring,
+        mock_stdin,
+        mock_open,
+        mock_getpass,
+        api_url,
+        expected_ui_url,
+        browser_opened,
+        time_machine,
+        monkeypatch,
+        tmp_path,
+        capsys,
+    ):
+        time_machine.move_to(FROZEN_NOW, tick=False)
+        monkeypatch.setenv("AIRFLOW_HOME", str(tmp_path))
+        mock_stdin.isatty.return_value = True
+        mock_open.return_value = browser_opened
+        mock_getpass.return_value = f"  {VALID_TOKEN}\n"
+
+        auth_command.login(
+            self.parser.parse_args(["auth", "login", "--api-url", api_url, "--web", "--env", "sso"]),
+            api_client=mock.Mock(spec=Client),
+        )
+
+        mock_open.assert_called_once_with(expected_ui_url)
+        mock_keyring.set_password.assert_called_once_with("airflowctl", "api_token_sso", VALID_TOKEN)
+        with open(tmp_path / "sso.json") as f:
+            assert json.load(f) == {"api_url": api_url}
+        output = capsys.readouterr().out
+        assert "Login successful" in output
+        assert "The token expires at" in output
+        assert ("Could not open a browser" in output) is not browser_opened
+
+    @pytest.mark.parametrize(
+        "extra_args",
+        [
+            pytest.param(["--api-token", "TOKEN"], id="api-token"),
+            pytest.param(["--username", "user"], id="username"),
+            pytest.param(["--password", "pass"], id="password"),
+            pytest.param(["--skip-keyring"], id="skip-keyring"),
+        ],
+    )
+    @mock.patch("airflowctl.ctl.commands.auth_command.webbrowser.open", autospec=True)
+    def test_login_web_rejects_conflicting_options(self, mock_open, extra_args):
+        with pytest.raises(SystemExit, match="1"):
+            auth_command.login(
+                self.parser.parse_args(["auth", "login", "--web", *extra_args]),
+                api_client=mock.Mock(spec=Client),
+            )
+        mock_open.assert_not_called()
+
+    @mock.patch("airflowctl.ctl.commands.auth_command.webbrowser.open", autospec=True)
+    @mock.patch("sys.stdin", spec=io.TextIOWrapper)
+    def test_login_web_requires_interactive_terminal(self, mock_stdin, mock_open):
+        mock_stdin.isatty.return_value = False
+
+        with pytest.raises(SystemExit, match="1"):
+            auth_command.login(
+                self.parser.parse_args(["auth", "login", "--web"]),
+                api_client=mock.Mock(spec=Client),
+            )
+        mock_open.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("pasted", "expected_error"),
+        [
+            pytest.param("", "not an Airflow token", id="empty"),
+            pytest.param("not-a-jwt", "not an Airflow token", id="not-a-jwt"),
+            pytest.param(_build_jwt({"sub": "1"}), "not an Airflow token", id="no-exp-claim"),
+            pytest.param(EXPIRED_TOKEN, "already expired", id="expired"),
+        ],
+    )
+    @mock.patch("airflowctl.ctl.commands.auth_command.getpass.getpass", autospec=True)
+    @mock.patch("airflowctl.ctl.commands.auth_command.webbrowser.open", autospec=True)
+    @mock.patch("sys.stdin", spec=io.TextIOWrapper)
+    @mock.patch("airflowctl.api.client.keyring", autospec=True)
+    def test_login_web_rejects_unusable_token(
+        self,
+        mock_keyring,
+        mock_stdin,
+        mock_open,
+        mock_getpass,
+        pasted,
+        expected_error,
+        time_machine,
+        capsys,
+    ):
+        time_machine.move_to(FROZEN_NOW, tick=False)
+        mock_stdin.isatty.return_value = True
+        mock_getpass.return_value = pasted
+
+        with pytest.raises(SystemExit, match="1"):
+            auth_command.login(
+                self.parser.parse_args(["auth", "login", "--web"]),
+                api_client=mock.Mock(spec=Client),
+            )
+        assert expected_error in capsys.readouterr().out
+        mock_keyring.set_password.assert_not_called()
 
 
 class TestListEnvs:
